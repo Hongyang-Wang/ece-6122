@@ -19,6 +19,17 @@ using namespace std;
 
 void Transform1D(Complex* h, int w, Complex* H);
 
+int _2d21d(int i, int j, int w) {
+	return i * w + j;
+}
+
+void store_transpose(Complex *tempImg, Complex *buf, int N, int w, int rank) {
+	for (int i = 0; i < N; i++) {
+		int ind = _2d21d(i % w, i / w + rank * N / w, w);
+		tempImg[ind] = tempImg[ind] + buf[i];
+	}
+}
+
 void Transform2D(const char* inputFN) 
 { // Do the 2D transform here.
   // 1) Use the InputImage object to read in the Tower.txt file and
@@ -43,21 +54,106 @@ void Transform2D(const char* inputFN)
   // Step (1) in the comments is the line above.
   // Your code here, steps 2-9
   // Step (2)
-  // int numtasks, rank;
-  // MPI_Comm_size(MPI_COMM_WORLD, &numtasks);
-  // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  // printf ("Total number of tasks= %d. My rank= %d\n", numtasks, rank);
+  int numtasks, rank, rc;
+  MPI_Comm_size(MPI_COMM_WORLD, &numtasks);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  printf ("numtasks=%d##rank=%d\n", numtasks, rank);
+  int N = h / numtasks * w;  // the num of elements for each process
   // Step (3)
-  Complex* outImg = new Complex[w * h];
+  Complex outImg[N];
   // Step (4)
   Complex* inImg = image.GetImageData();
   // Step (5)
-  for (int i = 0; i < w * h; i += w) {
-  	Transform1D(inImg + i, w, outImg + i);
+  for (int i = rank * N, j = 0; i < (rank + 1) * N; i += w, j += w) {
+  	Transform1D(inImg + i, w, outImg + j);
   }
+  // Step (6)
+  if (rank != 0) {
+    rc = MPI_Send(outImg, N * sizeof(Complex), MPI_CHAR, 0, 0, MPI_COMM_WORLD);  // all block-send to 0
+    if (rc != MPI_SUCCESS) {
+    	cout << "Send row 1d fft result failed: rank=" << rank << endl;
+    	MPI_Finalize();
+        return;
+    }
+    // column-wise fft
+    Complex buf[N];
+    MPI_Status status;
+ 	rc = MPI_Recv(buf, N * sizeof(Complex), MPI_CHAR, 0, 0, MPI_COMM_WORLD, &status);
+	if (rc != MPI_SUCCESS) {
+	    cout << "Receive row 1d fft result failed: src=" << 0 << endl;
+	    MPI_Finalize();
+	    return;
+	}
+	cout << "column-wise array received from 0: rank=" << rank << endl;
+	
+	// fft
+	Complex outImg2[N];
+	for (int i = 0; i < N; i += w) {
+		Transform1D(buf + i, w, outImg2 + i);
+	}	
+	cout << "column-wise fft done: rank=" << rank << endl;
 
-  //
-  image.SaveImageData("1d.out.text", outImg, w, h);
+	// send the result
+    rc = MPI_Send(outImg2, N * sizeof(Complex), MPI_CHAR, 0, 0, MPI_COMM_WORLD);  // all block-send to 0
+    if (rc != MPI_SUCCESS) {
+    	cout << "Send col 1d fft result failed: rank=" << rank << endl;
+    	MPI_Finalize();
+        return;
+    }	
+  }
+  else {
+  	Complex tempImg[w * h];
+  	// transpose 0's 1d row result
+	store_transpose(tempImg, outImg, N, w, 0);
+	// step (7)
+  	int count = 0;
+  	Complex buf[N];
+  	while (count < numtasks - 1) {
+	  MPI_Status status;
+	  rc = MPI_Recv(buf, N * sizeof(Complex), MPI_CHAR, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+	  if (rc != MPI_SUCCESS) {
+	      cout << "Receive row 1d fft result failed: src=" << status.MPI_SOURCE << endl;
+	      MPI_Finalize();
+	      return;
+	  }
+	  cout << "received from " << status.MPI_SOURCE << endl;
+	  count++;
+	  store_transpose(tempImg, buf, N, w, status.MPI_SOURCE);
+  	}
+  	// send to others (do not need blocking)
+  	for (int r = 1; r < numtasks; r++) {
+	    rc = MPI_Send(tempImg + r * N, N * sizeof(Complex), MPI_CHAR, r, 0, MPI_COMM_WORLD);  // all block-send to 0
+	    if (rc != MPI_SUCCESS) {
+	    	cout << "Send row 1d fft result failed: rank=" << r << endl;
+	    	MPI_Finalize();
+	        return;
+	    }
+	    cout << "sent to " << r << endl;
+    }
+    // column-wise fft
+    Complex outImg2[N];
+    for (int i = 0; i < N; i += w) {
+  		Transform1D(tempImg + i, w, outImg2 + i);
+  	}
+  	// store self result
+  	Complex finalImg[h * w];
+  	store_transpose(finalImg, outImg2, N, w, 0);
+  	// collect others' result
+  	count = 0;
+  	while (count < numtasks - 1) {
+	  MPI_Status status;
+	  rc = MPI_Recv(buf, N * sizeof(Complex), MPI_CHAR, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+	  if (rc != MPI_SUCCESS) {
+	      cout << "Receive row 1d fft result failed: src=" << status.MPI_SOURCE << endl;
+	      MPI_Finalize();
+	      return;
+	  }
+	  count++;
+	  store_transpose(finalImg, buf, N, w, status.MPI_SOURCE);
+  	}
+  	// save image
+  	image.SaveImageData("2d.out.text", finalImg, w, h);
+  }
 }
 
 void Transform1D(Complex* h, int w, Complex* H)
